@@ -40,6 +40,8 @@ sample_dependencies += dependency('libflexio')
 sample_srcs = [
 	# The sample itself
 	'host/' + SAMPLE_NAME + '_sample.c',
+	# utils.c
+	'host/' + 'utils.c',
 	# Main function for the sample's executable
 	SAMPLE_NAME + '_main.c',
 	# Common code for the DOCA library samples
@@ -49,6 +51,7 @@ sample_srcs = [
 sample_inc_dirs  = []
 # Common DOCA library logic
 sample_inc_dirs += include_directories('..')
+sample_inc_dirs += include_directories('/include')
 
 # DPA compiler build script
 dpacc_build_script_name = 'build_dpacc_samples.sh'
@@ -56,9 +59,14 @@ dpacc_build_script = meson.current_source_dir() + '/../' + dpacc_build_script_na
 # Sample device source code absolute path to be compiled by the DPACC
 sample_device_src = meson.project_source_root() + '/device/' +  SAMPLE_NAME + '_kernels_dev.c'
 
+# 为了解决device kernel代码找不到include的问题
+dpacc_env = environment()
+inc_dir_local = meson.project_source_root() + '/include'
+dpacc_env.set('DPACC_CPPFLAGS', '-I' + inc_dir_local)
+
 # Run DPA compiler 这个很重要，相当于我直接在命令行输了4个参数然后跑脚本
 run_command(dpacc_build_script, meson.project_build_root(), sample_device_src, SAMPLE_NAME,
-	    sample_program_name, check: true)
+	    sample_program_name, check: true, env: dpacc_env)
 
 # Dependencies
 sample_device_build_dir = meson.project_build_root() + '/' + SAMPLE_NAME + '/device/build_dpacc'
@@ -67,7 +75,13 @@ dpa_program_lib = meson.get_compiler('c').find_library(sample_program_name, dirs
 
 sample_dependencies += dpa_program_lib
 
+
+# 为了解决找不到C数学库的问题
+m_dep = meson.get_compiler('c').find_library('m', required: true)
+sample_dependencies += m_dep
+
 executable('doca_' + SAMPLE_NAME, sample_srcs,
 	dependencies : sample_dependencies,
 	include_directories: sample_inc_dirs,
-	install: false)
+	install: false,
+)

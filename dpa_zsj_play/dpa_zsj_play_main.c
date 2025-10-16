@@ -40,7 +40,12 @@ int main(int argc, char **argv)
 	int exit_status = EXIT_FAILURE;
 
 	/* Set default value for device name */
-	strcpy(cfg.device_name, DEVICE_DEFAULT_NAME);
+	// strcpy(cfg.device_name, DEVICE_DEFAULT_NAME);
+	strcpy(cfg.device_name, "mlx5_1");
+	// 敢情之前测的时候这个device就是本机
+	// 要改成DPA再用！
+	// mlx5_1是对的 mlx5_0找不到设备，mlx5_2没有分配EU（其中原理暂时还不太懂）
+
 
 	/* Register a logger backend */
 	result = doca_log_backend_create_standard();
@@ -57,7 +62,7 @@ int main(int argc, char **argv)
 
 	DOCA_LOG_INFO("Starting the sample");
 
-	result = doca_argp_init("doca_dpa_kernel_launch", &cfg);
+	result = doca_argp_init("doca_dpa_zsj_play", &cfg);
 	if (result != DOCA_SUCCESS) {
 		DOCA_LOG_ERR("Failed to init ARGP resources: %s", doca_error_get_descr(result));
 		goto sample_exit;
