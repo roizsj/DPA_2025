@@ -13,7 +13,10 @@
 
 #include <stdlib.h>
 #include <unistd.h>
-
+#include <time.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <errno.h>
 #include <doca_error.h>
 #include <doca_log.h>
 #include <doca_dev.h>
@@ -27,6 +30,7 @@ DOCA_LOG_REGISTER(ZSJ_PLAY::SAMPLE);
 /* Kernel function decleration */
 // extern doca_dpa_func_t l2_batch_kernel;
 extern doca_dpa_func_t l2_single_kernel;
+extern doca_dpa_func_t l2_batch_kernel;
 
 struct l2_single_dist_args {
     doca_dpa_dev_mmap_t handle;               // 共享内存的handle，DPA凭借这个来访问host mmap出来的内存
@@ -36,6 +40,29 @@ struct l2_single_dist_args {
     uint64_t dim;                      // e.g. 32
     uint64_t frac_bits;                // q (e.g. 16)
 };
+
+struct l2_batch_args {
+    doca_dpa_dev_mmap_t handle;
+
+    uint64_t a_base;
+    uint64_t b_base;
+    uint64_t out_base;
+
+    uint64_t a_stride;     // 每个向量 a 的步长（字节）
+    uint64_t b_stride;     // 每个向量 b 的步长（字节）
+    uint64_t out_stride;   // 每个输出 dist 的步长（字节）
+
+    uint32_t dim;          // 向量维度（例如 32）
+    uint32_t frac_bits;    // 定点位（例如 16）
+    uint32_t batch_size;   // 这一批里有多少个距离要算
+};
+
+static inline uint64_t diff_ns(struct timespec a, struct timespec b) {
+    int64_t sec  = (int64_t)b.tv_sec  - (int64_t)a.tv_sec;
+    int64_t nsec = (int64_t)b.tv_nsec - (int64_t)a.tv_nsec;
+    if (nsec < 0) { nsec += 1000000000LL; sec -= 1; }
+    return (uint64_t)sec * 1000000000ULL + (uint64_t)nsec;
+}
 
 /*
  * Run kernel_launch sample
@@ -50,10 +77,11 @@ doca_error_t kernel_launch(struct dpa_resources *resources)
 	/* Wait event threshold */
 	uint64_t wait_thresh = 0;
 	/* Completion event val */
-	uint64_t comp_event_val = 10;
+	uint64_t comp_event_val = 64;
 	/* Number of DPA threads */
-	const unsigned int num_dpa_threads = 1;
+	const unsigned int num_dpa_threads = 64;
 	doca_error_t result, tmp_result;
+	struct timespec t0, t1;
 
 	/* Creating DOCA sync event for DPA kernel completion */
 	result = create_doca_dpa_completion_sync_event(resources->doca_dpa, resources->doca_device, &comp_event);
@@ -62,41 +90,38 @@ doca_error_t kernel_launch(struct dpa_resources *resources)
 			     doca_error_get_descr(result));
 		return result;
 	}
-	const uint32_t dim = 32, T = 1024, q = 16; // params
+	const uint32_t dim = 32, q = 16, batch_size = 1024 * 1024; // params
 	
 	/* allocate host memory for input and output */
 	/* single vector distance calc */
-	double *a_raw = malloc(dim * sizeof(double));
-	double *b_raw = malloc(dim * sizeof(double));
+	double *a_raw = malloc(dim * sizeof(double) * batch_size);
+	double *b_raw = malloc(dim * sizeof(double) * batch_size);
 
-	for(size_t i = 0; i < dim; i++)
+	for(size_t i = 0; i < dim * batch_size; i++)
 	{
-		a_raw[i] = rand_double(-2.0, 2.0);
-		b_raw[i] = rand_double(-2.0, 2.0);
+		a_raw[i] = rand_double(-100.0, 100.0);
+		b_raw[i] = rand_double(-100.0, 100.0);
 	}
 
-	double dist_cpu = l2_distance(a_raw, b_raw, dim);
+	// double dist_cpu = l2_distance(a_raw, b_raw, dim); // 计算一组a,b的L2 distance
 
-	printf("L2 distance = %lf", dist_cpu);
 
 	// 准备a和b的Q16.16格式，位于host memory
-	int32_t *a_local = malloc(dim * sizeof(int32_t)); // query vector(Quantized)
-	int32_t *b_local = malloc(dim * sizeof(int32_t)); // b vector(Quantized)
+	int32_t *a_local = malloc(dim * sizeof(int32_t) * batch_size); // a vector(Quantized)
+	int32_t *b_local = malloc(dim * sizeof(int32_t) * batch_size); // b vector(Quantized)
 
-	double_array_to_q16_16(a_raw, a_local, dim);
-	double_array_to_q16_16(b_raw, b_local, dim);
+	double_array_to_q16_16(a_raw, a_local, dim * batch_size);
+	double_array_to_q16_16(b_raw, b_local, dim * batch_size);
 
 	// 准备用来存dist(a,b)的内存空间
-	uint64_t *out_local = malloc(sizeof(uint64_t));
+	uint64_t *out_local = malloc(sizeof(uint64_t) * batch_size);
 	// 置0
 	memset(out_local, 0, sizeof(uint64_t));
 
 	struct doca_mmap *mm = NULL; // mm
     doca_dpa_dev_mmap_t dpa_h = 0;  // DPA访问mmap内存时用到的handler
-    size_t base_off = 0;
 	// size_t total_bytes = 2 * dim * sizeof(int32_t) + sizeof(uint64_t) + sizeof(l2_single_dist_args); // 大小
-	size_t total_bytes = 1024 * 1024; // 先分配个1MB玩玩
-	// 一共是两个向量 + 一个output + 一个args
+	size_t total_bytes = 3 * batch_size * dim * sizeof(int32_t);
 
 	DOCA_LOG_INFO("Start allocating mmap for DPA");
 	doca_error_t st;
@@ -174,40 +199,51 @@ doca_error_t kernel_launch(struct dpa_resources *resources)
     }
 
 	// 把a,b,out拷贝到mmap出来的host memory里面
-	memcpy((uint8_t*)buf + base_off, a_local, dim * sizeof(int32_t));
-	memcpy((uint8_t*)buf + base_off + dim * sizeof(int32_t), b_local, dim * sizeof(int32_t));
-	memcpy((uint8_t*)buf + base_off + 2 * dim * sizeof(int32_t), out_local, 8);
+	memcpy((uint8_t*)buf, a_local, dim * batch_size * sizeof(int32_t));
+	memcpy((uint8_t*)buf + dim * batch_size * sizeof(int32_t), b_local, dim * batch_size * sizeof(int32_t));
+	memcpy((uint8_t*)buf + dim * batch_size * sizeof(int32_t), out_local, 8 * batch_size);
 
-    /* construct args */
-    struct l2_single_dist_args args;
+    /* single kernel args */
+    // struct l2_single_dist_args args;
+	// args.handle = dpa_h;
+	// args.a_offset = buf;
+	// args.b_offset = buf + dim * sizeof(int32_t);
+	// args.out_offset = buf + 2 * dim * sizeof(int32_t);
+	// args.frac_bits = 16;
+	// args.dim = 32;
+
+	/* batch kernel args */
+	struct l2_batch_args args;
 	args.handle = dpa_h;
-	args.a_offset = buf;
-	args.b_offset = buf + dim * sizeof(int32_t);
-	args.out_offset = buf + 2 * dim * sizeof(int32_t);
-	// args.a_offset = (uint8_t*)buf + base_off;
-	// args.b_offset = (uint8_t*)buf + base_off + dim * sizeof(int32_t);
-	// args.out_offset = (uint8_t*)buf + base_off + 2 * dim * sizeof(int32_t);
+	args.a_base = buf;
+	args.b_base = buf + batch_size * dim * sizeof(int32_t);
+	args.out_base = buf + 2 * batch_size * dim * sizeof(int32_t);
+	args.a_stride = dim * sizeof(int32_t);
+	args.b_stride = dim * sizeof(int32_t);
+	args.out_stride = sizeof(int64_t);
 	args.frac_bits = 16;
 	args.dim = 32;
-	// void* host_args_ptr = host_ptr + 2 * dim * sizeof(int32_t) + sizeof(uint64_t);
-    // memcpy(host_args_ptr, &hargs, sizeof(hargs));
+	args.batch_size = batch_size;
 
 	DOCA_LOG_INFO("All DPA resources have been created\n");
 	DOCA_LOG_INFO("args.handle = %u", args.handle);
-	DOCA_LOG_INFO("args.a_offset = %u", args.a_offset);
-	DOCA_LOG_INFO("args.b_offset = %u", args.b_offset);
-	DOCA_LOG_INFO("args.out_offset = %u", args.out_offset);
 	DOCA_LOG_INFO("args.dim = %u", args.dim);
 	DOCA_LOG_INFO("args.frac_bits = %u", args.frac_bits);
+	DOCA_LOG_INFO("args.batch_size = %u", args.batch_size);
+
+
+	doca_sync_event_get(comp_event, &comp_event_val);
+	printf("comp_event_val = %ld\n", comp_event_val);
 
 	/* kernel launch */
+	clock_gettime(CLOCK_MONOTONIC, &t0);
 	result = doca_dpa_kernel_launch_update_set(resources->doca_dpa,
 						   wait_event,
 						   wait_thresh,
 						   comp_event,
-						   comp_event_val,
+						   comp_event_val + 1,
 						   num_dpa_threads,
-						   &l2_single_kernel,
+						   &l2_batch_kernel,
 						   args);
 	if (result != DOCA_SUCCESS) {
 		DOCA_LOG_ERR("Failed to launch zsj's play kernel: %s", doca_error_get_descr(result));
@@ -215,15 +251,34 @@ doca_error_t kernel_launch(struct dpa_resources *resources)
 	}
 
 	/* Wait until completion event reach completion val */
-	result = doca_sync_event_wait_gt(comp_event, comp_event_val - 1, SYNC_EVENT_MASK_FFS);
+	result = doca_sync_event_wait_gt(comp_event, comp_event_val, SYNC_EVENT_MASK_FFS);
 	if (result != DOCA_SUCCESS)
 		DOCA_LOG_ERR("Failed to wait for host completion event: %s", doca_error_get_descr(result));
-	
-	uint64_t dist_sq_q2q = *(uint64_t *)args.out_offset;
-    double dist_dpa = sqrt((double)dist_sq_q2q) / (double)(1u << q);
+	clock_gettime(CLOCK_MONOTONIC, &t1);
 
-    printf("CPU L2 = %.8f, DPA L2 = %.8f, abs=%.3e, rel=%.3e\n",
-           dist_cpu, dist_dpa, fabs(dist_dpa - dist_cpu), (dist_cpu>0 ? fabs(dist_dpa-dist_cpu)/dist_cpu : 0.0));
+	uint64_t dpa_time_ns = diff_ns(t0, t1);
+	
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	for(uint32_t i = 0; i < batch_size; ++i)
+	{
+		int32_t *a = a_local + i * dim;
+		int32_t *b = b_local + i * dim;
+		int64_t dist = 0;
+		for (uint32_t j = 0; j < dim; ++j) {
+            int64_t da = (int64_t)a[j] - (int64_t)b[j];
+            dist += da * da;
+        }
+		out_local[i] = (uint64_t)dist;
+	}
+	clock_gettime(CLOCK_MONOTONIC, &t1);
+	uint64_t cpu_time_ns = diff_ns(t0, t1);
+	// uint64_t dist_sq_q2q = *(uint64_t *)args.out_offset;
+    // double dist_dpa = sqrt((double)dist_sq_q2q) / (double)(1u << q);
+
+    // printf("CPU L2 = %.8f, DPA L2 = %.8f, abs=%.3e, rel=%.3e\n",
+    //        dist_cpu, dist_dpa, fabs(dist_dpa - dist_cpu), (dist_cpu>0 ? fabs(dist_dpa-dist_cpu)/dist_cpu : 0.0));
+	printf("Kernel wall time: %.3f ms %lu ns\n", dpa_time_ns / 1e6, dpa_time_ns);
+	printf("CPU wall time: %.3f ms %lu ns\n", cpu_time_ns / 1e6, cpu_time_ns);
 
 recycle_event:
 	doca_mmap_stop(mm);
